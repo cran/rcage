@@ -1,0 +1,454 @@
+#' Regionalization of Multi-scale Spatial Processes
+#' 
+#' Implements a regionalization algorithm for multi-scale spatial processes 
+#' based on a criterion for spatial aggregation error. The multi-scale 
+#' representation is a truncated Karhunen-Loaeve expansion using Obled-Creutin 
+#' eigenfunctions. The method is incorporated within a Bayesian
+#' framework using a Markov chain Monte Carlo implementation of a 
+#' latent spatial model.
+#'
+#' Input 'nw' is the number of Monte Carlo samples to be used in estimating
+#' matrix W and the basis psi(A) when points data are not available or
+#' provide insufficient coverage 
+#' to obtain closed form expressions. It is recommended that 'nw' 
+#' be large; values below 1000 are automatically adjusted to the default value 
+#' of 20000. It is only appropriate to specify nw = NULL when the source 
+#' support data ('spatialData') contains SpatialPoints 
+#' data. If 'spatialData' does not contain SpatialPoints data but nw is not
+#' provided as input, it is set to 20000.
+#' 
+#' If input 'spatialData' does not represent the finest resolution
+#' upon which inference is to be made, input 'dB' must be specified. The area
+#' spanned by 'dB' must fully contain all of the source support data, i.e., no
+#' elements of 'spatialData' can lie outside of the boundary defined by 'dB'.
+#' If 'spatialData' is multi-resolution 'dB' must be provided as the integer
+#' element of 'spatialData' to be used as the finest resolution or as a 
+#' SpatialPolygons object defining the finest resolution.
+#' 
+#' Input 'gbf' allows users to specify a radial basis function beyond
+#' the internally implemented bi-square, Wendland, and Gaussian functions. If 
+#' a function is provided, the following formal arguments are required: 
+#' * crd an \{nCrd x 2\} matrix containing the coordinates at which the basis 
+#'   functions are to be evaluated;
+#' * knots an \{nKnots x 2\} matrix containing the x,y coordinates of the knots; 
+#' and
+#' * w the scaling factor/bandwidth for the basis function.
+#' The function must return a matrix of dimension 
+#' \{nCrd x nKnots\}.
+#' 
+#' For completeness, the bi-square function implemented in the package
+#' is of the form
+#' \deqn{\Psi_{j}(s) \equiv \left\{
+#' \begin{array}{rl} 
+#' \{1 - (||\mathrm{crd} - \mathrm{knots}_j||/w)^2\}^2 & \mathrm{if} ~ 
+#' ||\mathrm{crd}-\mathrm{knots}_j|| \leq w ,\\
+#' 0 & \mathrm{otherwise} \end{array} \right. . }
+#' 
+#' The Wendland function is
+#' \deqn{ \Psi_{j}(s) \equiv \left\{
+#' \begin{array}{rl} 
+#'  \{ 1 - d_{j}(s)\}^6 \{35 d_{j}(s)^2 + 18 d_j(s) + 3\}/3 ~ 0 \leq d_{j} \leq 1, \\
+#' 0 & \mathrm{otherwise} \end{array} \right. ,}
+#' where 
+#' \deqn{ d_{j}(s) = ||s - c_j||/w.}
+#'
+#' The Gaussian function is
+#' \deqn{ \Psi_{j}(s) =
+#'  \exp\{- \frac{1}{2} (||s - c_j||/w)^2\}.}
+#'
+#' The default prior distribution on the covariance matrix is the MI
+#' prior function 
+#' \deqn{K^{-1} = R_B^{-1} \mathcal{A} \{ Q^{'}_{B} (I-A)Q_{B}\}R_B^{-1},}
+#' as defined in the supplemental section of the original manuscript.
+#' 
+#' This package implements methods of the \code{ff} package in
+#' scenarios when memory size is of concern. The \code{ff} package
+#' stores variables on the disk rather than in RAM. Though it is 
+#' highly optimized, this choice does increase computation time.
+#' Intermediate variables used only internally are stored in a
+#' temp directory as defined by the \code{ff} package. To trigger
+#' this implementation, 'ffdir' must be set. Additionally note that some
+#' elements available in parallel are not implemented in combination with ffdir.
+#'
+#' The repeated calls to a clustering algorithm make this a time consuming 
+#' calculation. Parallel methods have been employed to improve computation
+#' times when possible.
+#'
+#'
+#' @encoding UTF-8
+#' @include inputPrep.R 
+#' @include optimalDCAGE.R map.R checkInputs.R
+#' 
+#' @name optRegion
+#' @rdname optRegion
+#' 
+#' @param spatialData A SpatialPolygonsDataFrame object, a
+#'   SpatialPointsDataFrame object as defined by 
+#'   package sp, or a list of said objects. The source support.
+#'
+#' @param response A numeric vector, character, or list of said objects. 
+#'   The value of interest.
+#'   If numeric, the vector must contain the response 
+#'   for all areal units of 'spatialData'. Specifically, if 'spatialData' is a 
+#'   list, the vector must include the value of interest for all data of 
+#'   element [[1]] followed by that for all data of element [[2]], etc.  
+#'   If a character, the column header of the data slot that holds the  
+#'   value of interest; if a list is provided in 'spatialData' 
+#'   each Spatial object must have the specified column header. If provided
+#'   as a list, the elements must correspond to the elements of the 
+#'   'spatialData' list.
+#'
+#' @param sigmavar A numeric vector/matrix, character, or list of said objects. 
+#'   The survey variance.
+#'   If numeric, the vector is the diagonal elements of the variance matrix
+#'   and it must contain the variance 
+#'   for all areal units of 'spatialData'. Specifically, if 'spatialData' is a 
+#'   list, the vector must 
+#'   include the variance for all data of element [[1]] followed by that for all 
+#'   data of element [[2]], etc.  Similarly, if a matrix.
+#'   If a character, the column header of the data slot that holds the  
+#'   diagonal elements of the variance; if a list is provided in 'spatialData' 
+#'   each Spatial object must have the specified column header. If provided
+#'   as a list, the elements must correspond to the elements of the 
+#'   'spatialData' list.
+#'
+#' @param \dots ignored. Used to require named input for remaining formals.
+#'
+#' @param cage A logical. If TRUE, CAGE is 
+#'   minimized to determine the optimal clustering. If FALSE, DCAGE is used.
+#'
+#' @param gL An integer. The smallest number of areal units to consider for 
+#'   regionalization.
+#'
+#' @param gU An integer. The largest number of areal units to consider for 
+#'   regionalization.
+#'
+#' @param w A numeric. The scaling factor for radial basis functions. 
+#'   See details for further information.
+#'
+#' @param nBurn An integer. The number of samples to skip before accepting
+#'   every nThin sample of the Gibbs sampling algorithm. The samples kept
+#'   are those defined by seq(from = nBurn+1, to = nGibbs, by = nThin).
+#'
+#' @param nGibbs An integer. The total number of Gibbs samples generated. See 
+#'   'nBurn' for more information.
+#'
+#' @param nThin An integer. Keep every nThin sample of the Gibbs sampling
+#'   algorithm once the burn specification has been satisfied. See 
+#'   'nBurn' for more information.
+#'
+#' @param x NULL, character, or numeric. The covariates for the large scale
+#'   variability model. If NULL, an intercept only model is assumed. 
+#'   If numeric (matrix), the covariates; the object must contain the covariates 
+#'   for all spatialData. Specifically, if 'spatialData' is a list, x must 
+#'   include the covariates for all data of element [[1]] followed by that for
+#'   all data of element [[2]], etc.  
+#'   If a character, the column header(s) of the data slot that holds the  
+#'   covariates; if a list is provided in 'spatialData' 
+#'   each Spatial object must have the specified column header. If provided
+#'   as a list, the elements must correspond to the elements of the 
+#'   'spatialData' list.
+#'
+#' @param sigma2_beta A numeric. The variance of the large scale variability
+#'   model. 
+#'
+#' @param sigma2_xi A numeric. The variance of the fine scale variability. 
+#'   Defaults to inverse Gamma.
+#'
+#' @param lambda A numeric vector. The r eigenvalues of the prior
+#'   distribution on the \{r x r\} covariance matrix Q.
+#'
+#' @param longlat A logical. TRUE indicates that 'spatialData' is in long/lat
+#'   coordinate system.
+#'
+#' @param dB NULL, integer or a SpatialPolygons object defining the 
+#'   finest resolution spatial object to be used for inference. If NULL,  
+#'   and only one SpatialPolygon object is provided in 'spatialData',
+#'   the finest resolution is taken to be the 'spatialData' object.
+#'   If 'spatialData' contains a list of objects, this input must be provided. 
+#'
+#' @param gbf NULL, function or function name. The function to use to calculate
+#'   the radial basis functions of the expansion of the   
+#'   Obled-Creutin eigenfunction. The bi-square (default),
+#'   the Wendland, and the Gaussian radial functions are available
+#'   through this implementation ('bisquare', 'wendland', 'gaussian'). 
+#'   All others must be defined by the user.  
+#'   See details for further information. 
+#'
+#' @param Qprior A character. The Q prior. Must be one of {'MI' or 'wish'} 
+#'   indicating the MI prior or the Inverse Wishart distribution, respectively.
+#'
+#' @param nw An integer or NULL. The number of Monte Carlo replicates to generate for
+#'   estimating the components of the Obled-Cruetin basis when points data is not available
+#'   or is insufficient for calculating these components. If <=0 or NULL, 
+#'   'spatialData' must be or include SpatialPoints data.
+#'
+#' @param knots A matrix or integer. If a matrix, the x,y coordinates of the 
+#'   knots of the radial 
+#'   basis functions. If an integer, the number of knots to generate using 
+#'   fields::cover.design().
+#'
+#' @param dataScale A function. If the response of interest was scaled, the 
+#'   function to undo the scaling. Used in plotting only.
+#'
+#' @param ffdir A character string. The directory in which ff objects are to be 
+#'   saved. See details for further information.
+#'
+#' @param cMethod A character. Must be one of \{'kmeans', 'hier'\}. Indicates 
+#'   if stats::kmeans() or ClustGeo::hclustgeo() is used to obtain clusters.
+#'
+#' @param alpha A numeric. If using cMethod = 'hier', a real value between 0 
+#'    and 1. This mixing parameter gives the relative importance of D0
+#'    compared to D1. D1 is taken to be the distance matrix
+#'    defined by sp::spDists. See ?ClustGeo::hclustgeo for further details.
+#'
+#' @param nCore An integer. If using Monte Carlo, the algorithm can be spread across
+#'    nCore cores to expedite calculations. If nCore <= 1L, no parallel
+#'    methods are used.
+#'
+#' @param wishartScale A numeric of NULL. If Qprior is "wish", the value
+#'   of the diagonal elements of the scale matrix provided to MCMCpack::riwish.
+#'   Default value is 100. Input is ignored if Qprior = 'MI'.
+#'
+#' @param dMax A numeric. If finest resolution data is SpatialPoints and 
+#'   Qprior is MI, the maximum distance at which points are considered
+#'   adjacent. If not specified, it is taken to be the upper boundary of the
+#'   lowest decile.
+#' 
+#' @param palette A character. The palette preference for plotting. The 
+#'   palette is coded to be the viridis palette with possible values
+#'   'viridis', 'magma', 'plasma', 'inferno', 'cividis'.
+#'
+#' @param plot A logical. TRUE indicates that final plot will be generated.
+#'
+#' @param parallelLog A character object. A file name for logging
+#'    parallel executions.
+#'
+#' @return A list.
+#' \item{call     }{The original call structure}
+#' \item{psi      }{A list containing the generating basis function and the 
+#'                  Oble-Cruetin normalization matrix}
+#' \item{minCAGE  }{The minimum CAGE/DCAGE.}
+#' \item{CAGETrack}{For the optimal clustering, the estimated CAGE/DCAGE 
+#'                  for each cluster.}
+#' \item{cluster  }{The results returned by kmeans() or hclustgeo() for 
+#'                  the optimal clustering.}
+#' \item{yOpt     }{The estimated value of 
+#'                  interest at each Gibbs sample clustered according
+#'                  to the optimal clustering. }
+#' \item{yFinest  }{The estimated value of 
+#'                  interest at each Gibbs sample clustered according
+#'                  to dB.}
+#' \item{criterion}{"CAGE" or "DCAGE"}
+#' 
+#' @references Bradley, J. R., Wikle, C. K., and Holan, S. H. (2017).
+#'   Regionalization of Multiscale Spatial Processes using a Criterion
+#'   for Spatial Aggregation Error. Journal of the Royal Statistical Society -
+#'   Series B, 79, 815--832.
+#'
+#' @import methods
+#'
+#' @examples
+#' 
+#' # create 5x5 square 
+#' 
+#' poly <- raster::rasterToPolygons(raster::raster(nrows = 5, ncols = 5,
+#'                                                 xmn = -1.25, xmx = 1.25,
+#'                                                 ymn = -1.25, ymx = 1.25,
+#'                                                 res = 0.5,
+#'                                                 crs = "+proj=longlat +datum=WGS84"))
+#' 
+#' # covariate assumed to be a norm(0,1)
+#' df <- data.frame("x" = stats::rnorm(n = 25))
+#' 
+#' # convert spatial data to data.frame
+#' dt <- sp::SpatialPolygonsDataFrame(poly, df)
+#' 
+#' knots <- cbind(c(-0.75, 0.0, 0.75, -0.75, 0.0, 0.75, -0.75, 0.0, 0.75),
+#'                c(-0.75,-0.75, -0.75, 0.0, 0.0, 0.0, 0.75, 0.75, 0.75))
+#'
+#' res <- optRegion(spatialData = dt,
+#'                  response = "x",
+#'                  sigmavar = rep(1, 25),
+#'                  gL = 5,
+#'                  gU = 7,
+#'                  nGibbs = 50L,
+#'                  nBurn = 10L,
+#'                  nThin = 1L,
+#'                  nw = 2000L,
+#'                  knots = knots)
+#' 
+#' @export
+optRegion <- function(spatialData, 
+                      response, 
+                      sigmavar, 
+                      ...,
+                      cage = TRUE,
+                      longlat = TRUE,
+                      dB = NULL, 
+                      gbf = "bisquare", 
+                      w = NULL, 
+                      knots = 75L, 
+                      nw = 0L, 
+                      nGibbs = 10000, 
+                      nBurn = 1000, 
+                      nThin = 1L,
+                      x = NULL, 
+                      sigma2_beta = 1e-4, 
+                      sigma2_xi = 1.0,
+                      Qprior = "MI",
+                      lambda = 1.0, 
+                      wishartScale = 100.0, 
+                      dMax = NULL,
+                      cMethod = 'kmeans', 
+                      gL = NULL, 
+                      gU = NULL, 
+                      alpha = 0.5, 
+                      ffdir = NULL,
+                      nCore = 1L, 
+                      parallelLog = NULL,
+                      plot = TRUE,
+                      dataScale = NULL, 
+                      palette = "plasma") {
+
+  Call <- match.call()
+
+  # ensures that cMethod is one of 'hier' or 'kmeans'
+  cMethod <- .check_cMethod(cMethod = cMethod)
+
+  # ensures that the number of cores is appropriately specified
+  # and if parallel methods requested, initiates the cluster
+  localCluster <- .check_nCore(nCore = nCore,
+                               parallelLog = parallelLog)
+
+  # generates Gibbs samples
+  ip <- .inputPrep(spatialData = spatialData,
+                   response = response,
+                   sigmavar = sigmavar,
+                   rr = w,
+                   longlat = longlat,
+                   nGibbs = nGibbs,
+                   nBurn = nBurn,
+                   nThin = nThin,
+                   x = x,
+                   sigma2_beta = sigma2_beta,
+                   sigma2_xi = sigma2_xi,
+                   lambda = lambda,
+                   dB = dB,
+                   gbf = gbf,
+                   Qprior = Qprior,
+                   nw = nw,
+                   knots = knots,
+                   ffdir = ffdir,
+                   localCluster = localCluster,
+                   wishartScale = wishartScale,
+                   dMax = dMax,
+                   cage = cage)
+
+  # fewest number of clusters to consider
+  if (is.null(x = gL)) {
+    gL <- floor(x = length(x = ip$dB) * 0.2)
+    message("minimum number of clusters set to ", gL)
+  }
+
+  # largest number of clusters to consider
+  if (is.null(x = gU)) {
+    gU <- floor(x = length(x = ip$dB) * 0.8)
+    message("maximum number of clusters set to ", gU)
+  }
+
+  if (is.null(x = ip$dB)) {
+    # if dB is NULL, using spatialData as finest resolution
+    dB <- spatialData
+  } else if (is.numeric(x = ip$dB)) {
+    # if dB is integer, using ip$dB element of spatialData as finest resolution
+    dB <- spatialData[[ ip$dB ]]
+  } else {
+    dB <- ip$dB
+  }
+
+  # {nB' x nGibbs}
+  if (is(object = ip$yFinest, class2 = "ff_matrix")) {
+    yFinest <- ff::ff(ip$yFinest[!ip$isEmpty,,drop=FALSE], 
+                      dim = c(sum(!ip$isEmpty), ncol(x = ip$yFinest)))
+  } else {
+    yFinest <- ip$yFinest[!ip$isEmpty,,drop=FALSE]
+  }
+
+  # remove empty dB cells for clustering
+  # determine optimal CAGE
+  # nSource' is the number of source units less any that have NA response
+  # nB' is the number of finest resolution units less any that do not contain data
+  optimal <- .optimalDCAGE(dB = dB[!ip$isEmpty,], # {nB'}
+                           yFinest = yFinest, #{nB' x nGibbs}
+                           ySource = ip$ySource, #{nGibbs x nSource'}
+                           finestOnSource = ip$finestOnSource[,!ip$isEmpty], #{nSource' x nB'}
+                           sourceAreas = ip$sourceAreas, #{nSource'}
+                           finestAreas = ip$finestAreas[!ip$isEmpty], #{nB'}
+                           gL = gL,
+                           gU = gU,
+                           cMethod = cMethod,
+                           alpha = alpha,
+                           localCluster = localCluster)
+
+  # close cluster
+  if (!is.null(localCluster)) {
+    parallel::stopCluster(localCluster)
+  }
+
+  optimal[[ "psi" ]] <- ip$psi
+  optimal[[ "yFinest" ]] <- ip$yFinest
+  if (ip$criterion) optimal[[ "criterion" ]] <- "CAGE"
+  if (!ip$criterion) optimal[[ "criterion" ]] <- "DCAGE"
+
+
+  if (any(ip$isEmpty)) {
+    i1 <- NULL
+    i2 <- NULL
+    if (is(object = optimal$yOpt, class2 = "ff_matrix")) {
+      optimal$yOpt <- ff::ffcolapply(EXPR = rbind(0.0, optimal$yOpt[,i1:i2]),
+                                     X = optimal$yOpt, 
+                                     RETURN = TRUE,
+                                     FF_RETURN = TRUE,
+                                     RETROW = nrow(x = optimal$yOpt) + 1L)
+    } else {
+      optimal$yOpt <- rbind(0.0, optimal$yOpt)
+    }
+    optimal$CAGETrack <- c(0.0, optimal$CAGETrack)
+    cluster <- integer(length = length(x = dB)) 
+    cluster[!ip$isEmpty] <- optimal$cluster$cluster
+    optimal$cluster$cluster <- cluster
+  }
+
+  if (plot) {
+    .mapIt(dB = dB, #{nB}
+           yFinest = optimal$yFinest, #{nB x nGibbs}
+           yOpt = optimal$yOpt, #{nC x nGibbs}
+           cage = optimal$CAGETrack, # {nC}
+           cluster = optimal$cluster$cluster, #{nB}
+           dataScale = dataScale,
+           palette = palette,
+           criterion = optimal$criterion)
+  }
+
+  if (is(object = optimal[[ "yFinest" ]], class2 = "ff_matrix")) {
+    yFinest <- optimal$yFinest
+
+    ffsave(list = "yFinest", file = file.path(ffdir, "yFinest"))
+    optimal[[ "yFinest" ]] <- file.path(ffdir, "yFinest")
+  }
+
+  if (is(object = optimal[[ "yOpt" ]], class2 = "ff_matrix")) {
+    yOpt <- optimal$yOpt
+
+    ffsave(list = "yOpt", file = file.path(ffdir, "yOpt"))
+    optimal[[ "yOpt" ]] <- file.path(ffdir, "yOpt")
+  }
+
+  optimal[[ "call" ]] <- Call
+
+  class(optimal) <- "rcage"
+
+  return( optimal )
+
+}
